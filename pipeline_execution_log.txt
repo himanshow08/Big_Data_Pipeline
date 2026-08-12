@@ -1,0 +1,236 @@
+  require_minimum_pandas_version()
+======================================================================
+STEP 1: INGESTION (read + narrow transformations)
+======================================================================
+Total ingested rows: 1100000
+Number of partitions after read: 4
+
+======================================================================
+STEP 2: DEMONSTRATE THE SKEW (row count per vehicle_id, top 10)
+======================================================================
++----------+---------+
+|vehicle_id|row_count|
++----------+---------+
+|HOT01     |200000   |
+|HOT04     |200000   |
+|HOT03     |200000   |
+|HOT02     |200000   |
+|HOT05     |200000   |
+|V0135     |200      |
+|V0465     |200      |
+|V0217     |200      |
+|V0113     |200      |
+|V0175     |200      |
++----------+---------+
+only showing top 10 rows
+======================================================================
+STEP 3: NAIVE (UNSALTED) AGGREGATION - TIMED
+======================================================================
+Naive groupBy completed. Distinct vehicles: 505
+Naive aggregation wall time: 2.644s
+(all 200,000 rows for each HOT vehicle land in ONE partition/task -> straggler)
+
+======================================================================
+STEP 4: SALTED AGGREGATION (skew mitigation) - TIMED
+======================================================================
+Salted aggregation completed. Distinct vehicles: 505
+Salted aggregation wall time: 4.102s
+
+Sample of final salted aggregation result (hot vehicles):
++----------+-------------+-----------------+--------------+
+|vehicle_id|vehicle_model|avg_engine_temp  |total_readings|
++----------+-------------+-----------------+--------------+
+|HOT01     |Scania-R500  |94.9988545       |200000        |
+|HOT02     |Volvo-FH16   |95.02219925000001|200000        |
+|HOT03     |MAN-TGX      |95.00838829999998|200000        |
+|HOT04     |DAF-XF       |94.98318665000001|200000        |
+|HOT05     |DAF-XF       |95.00977285000002|200000        |
++----------+-------------+-----------------+--------------+
+
+Sample of final salted aggregation result (normal vehicles, first 5):
++----------+-------------+-----------------+--------------+
+|vehicle_id|vehicle_model|avg_engine_temp  |total_readings|
++----------+-------------+-----------------+--------------+
+|V0001     |Volvo-FH16   |84.33055         |200           |
+|V0002     |Volvo-FH16   |85.08150000000002|200           |
+|V0003     |MAN-TGX      |84.12629999999999|200           |
+|V0004     |Scania-R500  |85.6277          |200           |
+|V0005     |Scania-R500  |84.33455         |200           |
++----------+-------------+-----------------+--------------+
+only showing top 5 rows
+
+======================================================================
+STEP 5: VERIFY correctness -> naive vs salted results should match
+======================================================================
+Vehicles compared: 505, mismatches (tolerance 0.01): 0
+Correctness check: PASSED
+
+======================================================================
+STEP 6: LINEAGE INSPECTION
+======================================================================
+(4) MapPartitionsRDD[84] at javaToPython at DirectMethodHandleAccessor.java:103 []
+ |  MapPartitionsRDD[83] at javaToPython at DirectMethodHandleAccessor.java:103 []
+ |  SQLExecutionRDD[82] at javaToPython at DirectMethodHandleAccessor.java:103 []
+ |  MapPartitionsRDD[81] at javaToPython at DirectMethodHandleAccessor.java:103 []
+ |  MapPartitionsRDD[80] at javaToPython at DirectMethodHandleAccessor.java:103 []
+ |  FileScanRDD[79] at javaToPython at DirectMethodHandleAccessor.java:103 []
+
+======================================================================
+STEP 7: EXPLAIN PLAN - showing Stage-forming shuffle (wide dependency)
+======================================================================
+== Physical Plan ==
+AdaptiveSparkPlan (21)
++- == Final Plan ==
+   ResultQueryStage (13)
+   +- * HashAggregate (12)
+      +- AQEShuffleRead (11), coalesced
+         +- ShuffleQueryStage (10), Statistics(sizeInBytes=30.0 KiB, rowCount=505)
+            +- Exchange (9)
+               +- * HashAggregate (8)
+                  +- * HashAggregate (7)
+                     +- AQEShuffleRead (6), coalesced
+                        +- ShuffleQueryStage (5), Statistics(sizeInBytes=2.1 MiB, rowCount=3.69E+4)
+                           +- Exchange (4)
+                              +- * HashAggregate (3)
+                                 +- * Project (2)
+                                    +- Scan csv  (1)
++- == Initial Plan ==
+   HashAggregate (20)
+   +- Exchange (19)
+      +- HashAggregate (18)
+         +- HashAggregate (17)
+            +- Exchange (16)
+               +- HashAggregate (15)
+                  +- Project (14)
+                     +- Scan csv  (1)
+
+
+(1) Scan csv 
+Output [3]: [vehicle_id#0, vehicle_model#1, engine_temp#2]
+Batched: false
+Location: InMemoryFileIndex [file:/home/claude/telemetry_raw.csv]
+ReadSchema: struct<vehicle_id:string,vehicle_model:string,engine_temp:double>
+
+(2) Project [codegen id : 1]
+Output [3]: [vehicle_model#1, engine_temp#2, concat(vehicle_id#0, _, cast(cast((rand(676108996919841009) * 20.0) as int) as string)) AS salted_vehicle_id#56]
+Input [3]: [vehicle_id#0, vehicle_model#1, engine_temp#2]
+
+(3) HashAggregate [codegen id : 1]
+Input [3]: [vehicle_model#1, engine_temp#2, salted_vehicle_id#56]
+Keys [2]: [salted_vehicle_id#56, vehicle_model#1]
+Functions [2]: [partial_sum(engine_temp#2), partial_count(1)]
+Aggregate Attributes [2]: [sum#95, count#96L]
+Results [4]: [salted_vehicle_id#56, vehicle_model#1, sum#97, count#98L]
+
+(4) Exchange
+Input [4]: [salted_vehicle_id#56, vehicle_model#1, sum#97, count#98L]
+Arguments: hashpartitioning(salted_vehicle_id#56, vehicle_model#1, 8), ENSURE_REQUIREMENTS, [plan_id=651]
+
+(5) ShuffleQueryStage
+Output [4]: [salted_vehicle_id#56, vehicle_model#1, sum#97, count#98L]
+Arguments: 0
+
+(6) AQEShuffleRead
+Input [4]: [salted_vehicle_id#56, vehicle_model#1, sum#97, count#98L]
+Arguments: coalesced
+
+(7) HashAggregate [codegen id : 2]
+Input [4]: [salted_vehicle_id#56, vehicle_model#1, sum#97, count#98L]
+Keys [2]: [salted_vehicle_id#56, vehicle_model#1]
+Functions [2]: [sum(engine_temp#2), count(1)]
+Aggregate Attributes [2]: [sum(engine_temp#2)#65, count(1)#64L]
+Results [4]: [vehicle_model#1, sum(engine_temp#2)#65 AS sum_temp#57, count(1)#64L AS cnt#58L, split(salted_vehicle_id#56, _, -1)[0] AS vehicle_id#66]
+
+(8) HashAggregate [codegen id : 2]
+Input [4]: [vehicle_model#1, sum_temp#57, cnt#58L, vehicle_id#66]
+Keys [2]: [vehicle_id#66, vehicle_model#1]
+Functions [2]: [partial_sum(sum_temp#57), partial_sum(cnt#58L)]
+Aggregate Attributes [2]: [sum#91, sum#92L]
+Results [4]: [vehicle_id#66, vehicle_model#1, sum#93, sum#94L]
+
+(9) Exchange
+Input [4]: [vehicle_id#66, vehicle_model#1, sum#93, sum#94L]
+Arguments: hashpartitioning(vehicle_id#66, vehicle_model#1, 8), ENSURE_REQUIREMENTS, [plan_id=687]
+
+(10) ShuffleQueryStage
+Output [4]: [vehicle_id#66, vehicle_model#1, sum#93, sum#94L]
+Arguments: 1
+
+(11) AQEShuffleRead
+Input [4]: [vehicle_id#66, vehicle_model#1, sum#93, sum#94L]
+Arguments: coalesced
+
+(12) HashAggregate [codegen id : 3]
+Input [4]: [vehicle_id#66, vehicle_model#1, sum#93, sum#94L]
+Keys [2]: [vehicle_id#66, vehicle_model#1]
+Functions [2]: [sum(sum_temp#57), sum(cnt#58L)]
+Aggregate Attributes [2]: [sum(sum_temp#57)#74, sum(cnt#58L)#75L]
+Results [4]: [vehicle_id#66, vehicle_model#1, (sum(sum_temp#57)#74 / cast(sum(cnt#58L)#75L as double)) AS avg_engine_temp#67, sum(cnt#58L)#75L AS total_readings#68L]
+
+(13) ResultQueryStage
+Output [4]: [vehicle_id#66, vehicle_model#1, avg_engine_temp#67, total_readings#68L]
+Arguments: 2
+
+(14) Project
+Output [3]: [vehicle_model#1, engine_temp#2, concat(vehicle_id#0, _, cast(cast((rand(676108996919841009) * 20.0) as int) as string)) AS salted_vehicle_id#56]
+Input [3]: [vehicle_id#0, vehicle_model#1, engine_temp#2]
+
+(15) HashAggregate
+Input [3]: [vehicle_model#1, engine_temp#2, salted_vehicle_id#56]
+Keys [2]: [salted_vehicle_id#56, vehicle_model#1]
+Functions [2]: [partial_sum(engine_temp#2), partial_count(1)]
+Aggregate Attributes [2]: [sum#95, count#96L]
+Results [4]: [salted_vehicle_id#56, vehicle_model#1, sum#97, count#98L]
+
+(16) Exchange
+Input [4]: [salted_vehicle_id#56, vehicle_model#1, sum#97, count#98L]
+Arguments: hashpartitioning(salted_vehicle_id#56, vehicle_model#1, 8), ENSURE_REQUIREMENTS, [plan_id=628]
+
+(17) HashAggregate
+Input [4]: [salted_vehicle_id#56, vehicle_model#1, sum#97, count#98L]
+Keys [2]: [salted_vehicle_id#56, vehicle_model#1]
+Functions [2]: [sum(engine_temp#2), count(1)]
+Aggregate Attributes [2]: [sum(engine_temp#2)#65, count(1)#64L]
+Results [4]: [vehicle_model#1, sum(engine_temp#2)#65 AS sum_temp#57, count(1)#64L AS cnt#58L, split(salted_vehicle_id#56, _, -1)[0] AS vehicle_id#66]
+
+(18) HashAggregate
+Input [4]: [vehicle_model#1, sum_temp#57, cnt#58L, vehicle_id#66]
+Keys [2]: [vehicle_id#66, vehicle_model#1]
+Functions [2]: [partial_sum(sum_temp#57), partial_sum(cnt#58L)]
+Aggregate Attributes [2]: [sum#91, sum#92L]
+Results [4]: [vehicle_id#66, vehicle_model#1, sum#93, sum#94L]
+
+(19) Exchange
+Input [4]: [vehicle_id#66, vehicle_model#1, sum#93, sum#94L]
+Arguments: hashpartitioning(vehicle_id#66, vehicle_model#1, 8), ENSURE_REQUIREMENTS, [plan_id=632]
+
+(20) HashAggregate
+Input [4]: [vehicle_id#66, vehicle_model#1, sum#93, sum#94L]
+Keys [2]: [vehicle_id#66, vehicle_model#1]
+Functions [2]: [sum(sum_temp#57), sum(cnt#58L)]
+Aggregate Attributes [2]: [sum(sum_temp#57)#74, sum(cnt#58L)#75L]
+Results [4]: [vehicle_id#66, vehicle_model#1, (sum(sum_temp#57)#74 / cast(sum(cnt#58L)#75L as double)) AS avg_engine_temp#67, sum(cnt#58L)#75L AS total_readings#68L]
+
+(21) AdaptiveSparkPlan
+Output [4]: [vehicle_id#66, vehicle_model#1, avg_engine_temp#67, total_readings#68L]
+Arguments: isFinalPlan=true
+
+
+
+======================================================================
+STEP 8: ITERATIVE LOOP + CHECKPOINTING (truncating a growing DAG)
+======================================================================
+Iteration 10: lineage depth BEFORE checkpoint = 6 lines, AFTER checkpoint = 6 lines (truncated)
+Iteration 20: lineage depth BEFORE checkpoint = 6 lines, AFTER checkpoint = 6 lines (truncated)
+Iteration 30: lineage depth BEFORE checkpoint = 6 lines, AFTER checkpoint = 6 lines (truncated)
+
+Final row count after 30 iterations with periodic checkpointing: 1100000
+Final lineage (should be shallow -> reads from last checkpoint, not 30 chained transforms):
+b'(4) MapPartitionsRDD[116] at javaToPython at DirectMethodHandleAccessor.java:103 []\n |  MapPartitionsRDD[115] at javaToPython at DirectMethodHandleAccessor.java:103 []\n |  SQLExecutionRDD[114] at javaToPython at DirectMethodHandleAccessor.java:103 []\n |  MapPartitionsRDD[113] at javaToPython at DirectMethodHandleAccessor.java:103 []\n |  MapPartitionsRDD[111] at checkpoint at DirectMethodHandleAccessor.java:103 []\n |  ReliableCheckpointRDD[112] at checkpoint at DirectMethodHandleAccessor.java:103 []'
+
+======================================================================
+STEP 9: WRITE FINAL RESULT TO DISK (Action)
+======================================================================
+Written to /home/claude/output/avg_temp_by_vehicle
+
+PIPELINE COMPLETE.
